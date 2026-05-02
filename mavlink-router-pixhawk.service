@@ -1,0 +1,21 @@
+[Unit]
+Description=MAVLink Router - Pixhawk 6C Mini to QGroundControl
+Documentation=https://github.com/mavlink-router/mavlink-router
+After=network.target
+Wants=network.target
+After=dev-ttyUSB0.device
+BindsTo=dev-ttyUSB0.device
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mavlink-routerd -c /etc/mavlink-router/main.conf --syslog
+Restart=on-failure
+RestartSec=5
+User=root
+Group=dialout
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/mavlink-router
+
+[Install]
+WantedBy=multi-user.target

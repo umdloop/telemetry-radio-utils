@@ -68,6 +68,16 @@ def send_cmd(ser: serial.Serial, cmd: str, expect: str = "OK") -> tuple[bool, st
 
 def enter_command_mode(ser: serial.Serial) -> bool:
     """1 second of silence is required before AND after sending +++."""
+    # If a previous run left the radio in command mode (e.g. crashed without ATO),
+    # the radio will echo +++ instead of responding OK. Probe first to skip the
+    # guard-time dance and avoid confusing the radio further.
+    ser.reset_input_buffer()
+    ser.write(b"AT\r\n")
+    resp = read_response(ser, timeout=1.0)
+    if "OK" in resp:
+        print("  ✓ Already in command mode.")
+        return True
+
     print("  Waiting guard time before +++ ...")
     ser.reset_input_buffer()
     time.sleep(GUARD_TIME)
@@ -157,31 +167,33 @@ def run_status(ser: serial.Serial, show_local: bool, show_remote: bool) -> bool:
     if not enter_command_mode(ser):
         return False
 
-    if show_local:
-        print("\n  Reading local radio (ATI5)...")
-        ok, resp = send_cmd(ser, "ATI5", expect="S0")
-        if not ok:
-            print(f"  ✗ ATI5 failed: {repr(resp)}")
-        else:
-            params = parse_params(resp)
-            if params:
-                print_status("LOCAL RADIO", params)
+    try:
+        if show_local:
+            print("\n  Reading local radio (ATI5)...")
+            ok, resp = send_cmd(ser, "ATI5", expect="S0")
+            if not ok:
+                print(f"  ✗ ATI5 failed: {repr(resp)}")
             else:
-                print(f"  Raw response:\n{resp}")
+                params = parse_params(resp)
+                if params:
+                    print_status("LOCAL RADIO", params)
+                else:
+                    print(f"  Raw response:\n{resp}")
 
-    if show_remote:
-        print("\n  Reading remote radio (RTI5)...")
-        ok, resp = send_cmd(ser, "RTI5", expect="S0")
-        if not ok:
-            print(f"  ✗ RTI5 failed — is the remote radio connected? Got: {repr(resp)}")
-        else:
-            params = parse_params(resp)
-            if params:
-                print_status("REMOTE RADIO", params)
+        if show_remote:
+            print("\n  Reading remote radio (RTI5)...")
+            ok, resp = send_cmd(ser, "RTI5", expect="S0")
+            if not ok:
+                print(f"  ✗ RTI5 failed — is the remote radio connected? Got: {repr(resp)}")
             else:
-                print(f"  Raw response:\n{resp}")
+                params = parse_params(resp)
+                if params:
+                    print_status("REMOTE RADIO", params)
+                else:
+                    print(f"  Raw response:\n{resp}")
+    finally:
+        send_cmd(ser, "ATO", expect="")
 
-    send_cmd(ser, "ATO", expect="")
     return True
 
 
@@ -199,35 +211,41 @@ def configure_band(ser: serial.Serial, band: str) -> bool:
     if not enter_command_mode(ser):
         return False
 
-    print("\n  Current parameters:")
-    _, resp = send_cmd(ser, "ATI5", expect="S0")
-    params   = parse_params(resp)
-    cur_band = detect_band(params)
-    print(f"  Current band: {cur_band}")
+    rebooting = False
+    try:
+        print("\n  Current parameters:")
+        _, resp = send_cmd(ser, "ATI5", expect="S0")
+        params   = parse_params(resp)
+        cur_band = detect_band(params)
+        print(f"  Current band: {cur_band}")
 
-    if (params.get("MIN_FREQ") == str(cfg["MIN_FREQ"]) and
-            params.get("MAX_FREQ") == str(cfg["MAX_FREQ"])):
-        print("  ✓ Radio is already configured for this band. No changes needed.")
-        send_cmd(ser, "ATO", expect="")
-        return True
+        if (params.get("MIN_FREQ") == str(cfg["MIN_FREQ"]) and
+                params.get("MAX_FREQ") == str(cfg["MAX_FREQ"])):
+            print("  ✓ Radio is already configured for this band. No changes needed.")
+            return True
 
-    steps = [
-        (f"ATS8={cfg['MIN_FREQ']}", "Setting MIN_FREQ"),
-        (f"ATS9={cfg['MAX_FREQ']}", "Setting MAX_FREQ"),
-        ("AT&W",                    "Writing to EEPROM"),
-    ]
+        steps = [
+            (f"ATS8={cfg['MIN_FREQ']}", "Setting MIN_FREQ"),
+            (f"ATS9={cfg['MAX_FREQ']}", "Setting MAX_FREQ"),
+            ("AT&W",                    "Writing to EEPROM"),
+        ]
 
-    for cmd, label in steps:
-        print(f"\n  {label}: {cmd}")
-        ok, resp = send_cmd(ser, cmd)
-        print(f"    → {resp}")
-        if not ok:
-            print(f"  ✗ Expected OK from '{cmd}'. Aborting.")
-            return False
+        for cmd, label in steps:
+            print(f"\n  {label}: {cmd}")
+            ok, resp = send_cmd(ser, cmd)
+            print(f"    → {resp}")
+            if not ok:
+                print(f"  ✗ Expected OK from '{cmd}'. Aborting.")
+                return False
 
-    print("\n  Rebooting radio (ATZ)...")
-    ser.write(b"ATZ\r\n")
-    time.sleep(2.0)
+        # ATZ reboots the radio, so no ATO needed on this path
+        rebooting = True
+        print("\n  Rebooting radio (ATZ)...")
+        ser.write(b"ATZ\r\n")
+        time.sleep(2.0)
+    finally:
+        if not rebooting:
+            send_cmd(ser, "ATO", expect="")
 
     print(f"\n  ✓ Radio configured for {cfg['label']}")
     print("  Power-cycle if the remote radio does not reconnect.")

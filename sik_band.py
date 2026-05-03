@@ -5,10 +5,18 @@ Configures MIN_FREQ/MAX_FREQ for competition sub-bands (section 3.b.v),
 and provides a status read of all current parameters on local and remote radios.
 
 Usage:
-  python3 sik_band.py <device> band <low|mid|high>   # Configure a sub-band
-  python3 sik_band.py <device> status                 # Show local radio status
-  python3 sik_band.py <device> status --remote        # Show remote radio status
-  python3 sik_band.py <device> status --both          # Show local + remote status
+  python3 sik_band.py <device> band <low|mid|high>              # Configure both radios
+  python3 sik_band.py <device> band <low|mid|high> --local-only # Configure local only
+  python3 sik_band.py <device> status                           # Show local radio status
+  python3 sik_band.py <device> status --remote                  # Show remote radio status
+  python3 sik_band.py <device> status --both                    # Show local + remote status
+
+Band change reboot sequence:
+  1. Write local EEPROM  (ATS8 / ATS9 / AT&W)
+  2. Write remote EEPROM (RTS8 / RTS9 / RT&W)  — while still on shared current band
+  3. Reboot remote (RTZ) — RF link drops briefly
+  4. Reboot local  (ATZ) — both come up on new band
+  5. Re-enter command mode and verify both radios report the new band
 """
 
 import serial
@@ -59,9 +67,10 @@ def read_response(ser: serial.Serial, timeout: float = CMD_TIMEOUT) -> str:
     return response.strip()
 
 
-def send_cmd(ser: serial.Serial, cmd: str, expect: str = "OK") -> tuple[bool, str]:
+def send_cmd(ser: serial.Serial, cmd: str, expect: str = "OK",
+             timeout: float = CMD_TIMEOUT) -> tuple[bool, str]:
     ser.write((cmd + "\r\n").encode())
-    resp = read_response(ser)
+    resp = read_response(ser, timeout=timeout)
     ok = expect.lower() in resp.lower()
     return ok, resp
 
@@ -197,7 +206,25 @@ def run_status(ser: serial.Serial, show_local: bool, show_remote: bool) -> bool:
     return True
 
 
-def configure_band(ser: serial.Serial, band: str) -> bool:
+def _write_eeprom(ser: serial.Serial, prefix: str, cfg: dict,
+                  timeout: float = CMD_TIMEOUT) -> bool:
+    """Write MIN_FREQ / MAX_FREQ / &W using the given AT or RT prefix."""
+    steps = [
+        (f"{prefix}S8={cfg['MIN_FREQ']}", f"{prefix}S8"),
+        (f"{prefix}S9={cfg['MAX_FREQ']}", f"{prefix}S9"),
+        (f"{prefix}&W",                   f"{prefix}&W"),
+    ]
+    for cmd, label in steps:
+        print(f"    {label} → ", end="", flush=True)
+        ok, resp = send_cmd(ser, cmd, timeout=timeout)
+        print(resp)
+        if not ok:
+            print(f"  ✗ Expected OK from '{cmd}'. Aborting.")
+            return False
+    return True
+
+
+def configure_band(ser: serial.Serial, band: str, local_only: bool = False) -> bool:
     band = band.lower()
     if band not in BANDS:
         print(f"  ✗ Unknown band '{band}'. Choose from: {', '.join(BANDS)}")
@@ -211,45 +238,111 @@ def configure_band(ser: serial.Serial, band: str) -> bool:
     if not enter_command_mode(ser):
         return False
 
-    rebooting = False
+    rebooting      = False
+    remote_present = False
     try:
-        print("\n  Current parameters:")
-        _, resp = send_cmd(ser, "ATI5", expect="S0")
-        params   = parse_params(resp)
-        cur_band = detect_band(params)
-        print(f"  Current band: {cur_band}")
+        # ── Read current state ────────────────────────────────────────────
+        _, resp     = send_cmd(ser, "ATI5", expect="S0")
+        local_params = parse_params(resp)
+        print(f"\n  Local  now  : {detect_band(local_params)}")
 
-        if (params.get("MIN_FREQ") == str(cfg["MIN_FREQ"]) and
-                params.get("MAX_FREQ") == str(cfg["MAX_FREQ"])):
-            print("  ✓ Radio is already configured for this band. No changes needed.")
+        local_already = (
+            local_params.get("MIN_FREQ") == str(cfg["MIN_FREQ"]) and
+            local_params.get("MAX_FREQ") == str(cfg["MAX_FREQ"])
+        )
+
+        remote_already = False
+        if not local_only:
+            _, resp = send_cmd(ser, "RTI5", expect="S0", timeout=4.0)
+            remote_params = parse_params(resp)
+            if remote_params:
+                remote_present = True
+                print(f"  Remote now  : {detect_band(remote_params)}")
+                remote_already = (
+                    remote_params.get("MIN_FREQ") == str(cfg["MIN_FREQ"]) and
+                    remote_params.get("MAX_FREQ") == str(cfg["MAX_FREQ"])
+                )
+            else:
+                print("  Remote      : not responding — will configure local only")
+
+        if local_already and (local_only or not remote_present or remote_already):
+            print("\n  ✓ Already on target band. No changes needed.")
             return True
 
-        steps = [
-            (f"ATS8={cfg['MIN_FREQ']}", "Setting MIN_FREQ"),
-            (f"ATS9={cfg['MAX_FREQ']}", "Setting MAX_FREQ"),
-            ("AT&W",                    "Writing to EEPROM"),
-        ]
-
-        for cmd, label in steps:
-            print(f"\n  {label}: {cmd}")
-            ok, resp = send_cmd(ser, cmd)
-            print(f"    → {resp}")
-            if not ok:
-                print(f"  ✗ Expected OK from '{cmd}'. Aborting.")
+        # ── Write EEPROMs before touching any reboot ──────────────────────
+        # Both must be written while radios are still on the shared current band.
+        if not local_already:
+            print("\n  Writing local EEPROM...")
+            if not _write_eeprom(ser, "AT", cfg):
                 return False
+        else:
+            print("\n  Local EEPROM already correct — skipping.")
 
-        # ATZ reboots the radio, so no ATO needed on this path
+        if remote_present and not remote_already:
+            print("\n  Writing remote EEPROM (RT commands)...")
+            if not _write_eeprom(ser, "RT", cfg, timeout=4.0):
+                return False
+        elif remote_present:
+            print("\n  Remote EEPROM already correct — skipping.")
+
+        # ── Reboot sequence ───────────────────────────────────────────────
+        # Remote reboots first; the RF link drops briefly while remote is on
+        # the new band and local is still on the old band.  ATZ is purely
+        # a local serial command so it works even with no RF link.
         rebooting = True
-        print("\n  Rebooting radio (ATZ)...")
+        if remote_present:
+            print("\n  Rebooting remote (RTZ) — RF link will drop briefly...")
+            ser.write(b"RTZ\r\n")
+            time.sleep(3.0)
+
+        print("  Rebooting local (ATZ)...")
         ser.write(b"ATZ\r\n")
-        time.sleep(2.0)
+        time.sleep(3.0)
+
     finally:
         if not rebooting:
             send_cmd(ser, "ATO", expect="")
 
-    print(f"\n  ✓ Radio configured for {cfg['label']}")
-    print("  Power-cycle if the remote radio does not reconnect.")
-    return True
+    # ── Verify ────────────────────────────────────────────────────────────
+    print("\n  Verifying configuration...")
+    if not enter_command_mode(ser):
+        print("  ✗ Could not re-enter command mode after reboot.")
+        return False
+
+    success = False
+    try:
+        _, resp      = send_cmd(ser, "ATI5", expect="S0")
+        local_params = parse_params(resp)
+        local_ok     = (
+            local_params.get("MIN_FREQ") == str(cfg["MIN_FREQ"]) and
+            local_params.get("MAX_FREQ") == str(cfg["MAX_FREQ"])
+        )
+        print(f"  Local  : {detect_band(local_params)}  {'✓' if local_ok else '✗ MISMATCH'}")
+
+        remote_ok = True
+        if remote_present:
+            _, resp       = send_cmd(ser, "RTI5", expect="S0", timeout=5.0)
+            remote_params = parse_params(resp)
+            if remote_params:
+                remote_ok = (
+                    remote_params.get("MIN_FREQ") == str(cfg["MIN_FREQ"]) and
+                    remote_params.get("MAX_FREQ") == str(cfg["MAX_FREQ"])
+                )
+                print(f"  Remote : {detect_band(remote_params)}  {'✓' if remote_ok else '✗ MISMATCH'}")
+            else:
+                print("  Remote : ✗ not responding after reboot — check power/cable")
+                remote_ok = False
+
+        success = local_ok and remote_ok
+    finally:
+        send_cmd(ser, "ATO", expect="")
+
+    if success:
+        print(f"\n  ✓ Both radios confirmed on {cfg['label']}")
+    else:
+        print(f"\n  ⚠  Verification incomplete — run: python3 sik_band.py <device> status --both")
+
+    return success
 
 
 def main():
@@ -258,12 +351,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 sik_band.py /dev/ttyUSB0 status              # local radio status
-  python3 sik_band.py /dev/ttyUSB0 status --remote     # remote radio status
-  python3 sik_band.py /dev/ttyUSB0 status --both       # both radios
-  python3 sik_band.py /dev/ttyUSB0 band low            # set 900-Low (902–910 MHz)
-  python3 sik_band.py /dev/ttyUSB0 band mid            # set 900-Mid (911–919 MHz)
-  python3 sik_band.py /dev/ttyUSB0 band high           # set 900-High (920–928 MHz)
+  python3 sik_band.py /dev/ttyUSB0 status                       # local radio status
+  python3 sik_band.py /dev/ttyUSB0 status --remote              # remote radio status
+  python3 sik_band.py /dev/ttyUSB0 status --both                # both radios
+  python3 sik_band.py /dev/ttyUSB0 band low                     # set both radios to 900-Low
+  python3 sik_band.py /dev/ttyUSB0 band mid                     # set both radios to 900-Mid
+  python3 sik_band.py /dev/ttyUSB0 band high                    # set both radios to 900-High
+  python3 sik_band.py /dev/ttyUSB0 band high --local-only       # set local radio only
         """
     )
     parser.add_argument("device", help="Serial device, e.g. /dev/ttyUSB0 or /dev/ttyTELEM")
@@ -277,6 +371,8 @@ Examples:
 
     band_p = subparsers.add_parser("band", help="Configure a competition sub-band")
     band_p.add_argument("band", choices=["low", "mid", "high"], help="Target sub-band")
+    band_p.add_argument("--local-only", action="store_true",
+                        help="Configure local radio only (skip remote)")
 
     args = parser.parse_args()
 
@@ -293,7 +389,7 @@ Examples:
             show_local  = not args.remote or args.both
             success = run_status(ser, show_local, show_remote)
         else:
-            success = configure_band(ser, args.band)
+            success = configure_band(ser, args.band, local_only=args.local_only)
 
     sys.exit(0 if success else 1)
 

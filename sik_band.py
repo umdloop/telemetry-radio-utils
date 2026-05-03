@@ -28,6 +28,7 @@ BANDS = {
     "low":  {"MIN_FREQ": 902000, "MAX_FREQ": 910000, "label": "900-Low  (902–910 MHz)"},
     "mid":  {"MIN_FREQ": 911000, "MAX_FREQ": 919000, "label": "900-Mid  (911–919 MHz)"},
     "high": {"MIN_FREQ": 920000, "MAX_FREQ": 928000, "label": "900-High (920–928 MHz)"},
+    "all":  {"MIN_FREQ": 902000, "MAX_FREQ": 928000, "label": "900-Full (902–928 MHz) — non-competition"},
 }
 
 PARAM_INFO = {
@@ -357,6 +358,7 @@ Examples:
   python3 sik_band.py /dev/ttyUSB0 band low                     # set both radios to 900-Low
   python3 sik_band.py /dev/ttyUSB0 band mid                     # set both radios to 900-Mid
   python3 sik_band.py /dev/ttyUSB0 band high                    # set both radios to 900-High
+  python3 sik_band.py /dev/ttyUSB0 band all                     # full 902-928 MHz (bench/non-competition)
   python3 sik_band.py /dev/ttyUSB0 band high --local-only       # set local radio only
         """
     )
@@ -370,7 +372,7 @@ Examples:
     status_group.add_argument("--both",   action="store_true", help="Show both local and remote radios")
 
     band_p = subparsers.add_parser("band", help="Configure a competition sub-band")
-    band_p.add_argument("band", choices=["low", "mid", "high"], help="Target sub-band")
+    band_p.add_argument("band", choices=["low", "mid", "high", "all"], help="Target sub-band")
     band_p.add_argument("--local-only", action="store_true",
                         help="Configure local radio only (skip remote)")
 
